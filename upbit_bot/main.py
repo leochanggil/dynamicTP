@@ -35,10 +35,26 @@ async def main():
         await notifier.start()
 
         st = State()
+        # === [시장 지표 초기화 로직 추가] ===
+        # 1. 모든 KRW 마켓 코드 확보
+        all_mkts = await rest.markets_all()
+        all_krw_codes = [m['market'] for m in all_mkts if m['market'].startswith("KRW-")]
+        
+        # 2. 전체 마켓의 Ticker 정보 일괄 조회
+        all_tickers = await rest.tickers(all_krw_codes)
+        
+        # 3. State에 전일 종가 및 BTC 초기 누적 대금 저장
+        for t in all_tickers:
+            m = t['market']
+            st.prev_day_close[m] = float(t['prev_closing_price'])
+            if m == "KRW-BTC":
+                # 💡 [수정] 24h 롤링값이 아닌 당일(09시 리셋) 누적액 사용
+                st.initial_btc_total_vol = float(t['acc_trade_price'])
+        # ==================================
         ledger = TradeLedger(cfg.paper_dir)
-
         strat = BurstEntryStrategy(
             rest=rest, st=st, notifier=notifier, logger=get_logger("strategy"),
+            all_krw_markets=all_krw_codes,  # [추가] 10분 주기 루프에서 사용할 전체 마켓 리스트
             dry_run=cfg.dry_run,
             krw_per_trade=cfg.krw_per_trade,
             max_positions=cfg.max_positions,
@@ -55,7 +71,8 @@ async def main():
             timeout_sec=cfg.timeout_sec,
             use_dynamic_tp=cfg.use_dynamic_tp,        # [추가]
             dynamic_tp_sec=cfg.dynamic_tp_sec,        # [추가]
-            dynamic_tp_ratio=cfg.dynamic_tp_ratio     # [추가]
+            dynamic_tp_ratio=cfg.dynamic_tp_ratio,     # [추가]
+            safe_tp_pct=cfg.safe_tp_pct
         )
 
         ws = UpbitWSClient(markets, get_logger("ws"))

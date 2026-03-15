@@ -1,7 +1,6 @@
 from __future__ import annotations
 from collections import defaultdict, deque
 from datetime import datetime
-
 from .models import Candle1m, Position
 
 class State:
@@ -12,8 +11,13 @@ class State:
         self.last_price: dict[str, float] = {}
         self.positions: dict[str, Position] = {}
         self.cooldown_until: dict[str, datetime] = {}
-        self.short_ticks = defaultdict(lambda: deque(maxlen=2000))
-        self.waiting_pullback: dict[str, datetime] = {}  # 눌림목 대기 명단
+        self.short_ticks = defaultdict(lambda: deque(maxlen=10000))
+        self.waiting_pullback: dict[str, dict] = {} 
+        self.prev_day_close: dict[str, float] = {}
+        self.market_score = 0
+        self.market_target_rate = -0.3  # 기본값 (중립)
+        self.btc_vol_history = deque(maxlen=3) # 10분 단위이므로 3개면 30분
+        self.initial_btc_total_vol = 0.0
 
     def add_buy(self, market: str, minute: datetime, krw: float) -> None:
         self.buy_amt[market][minute] += krw

@@ -1,6 +1,5 @@
 from __future__ import annotations
 import asyncio
-import config
 from datetime import timedelta
 
 from .models import Candle1m, Position, now_kst, iso_to_kst, trade_ts_to_minute_kst
@@ -10,13 +9,14 @@ from .rest_client import UpbitREST
 from .notifier import TelegramNotifier
 from .ledger import TradeLedger
 
+
 class BurstEntryStrategy:
-    def __init__(self, rest: UpbitREST, st: State, notifier: TelegramNotifier, logger,
+    def __init__(self, rest: UpbitREST, st: State, notifier: TelegramNotifier, logger, all_krw_markets: list[str],
                  dry_run: bool, krw_per_trade: int, max_positions: int, cooldown_sec: int,
                  buy_pressure_th: float, vol_spike_mult: float, min_amt: float,
                  tp_pct: float, sl_pct: float, paper_mode: bool, 
                  ledger: TradeLedger, fee_rate: float, slip_rate: float, timeout_sec: int,
-                 use_dynamic_tp: bool, dynamic_tp_sec: int, dynamic_tp_ratio: float): # [추가]
+                 use_dynamic_tp: bool, dynamic_tp_sec: int, dynamic_tp_ratio: float, safe_tp_pct: float): # [추가]
 
         self.paper_mode = paper_mode
         self.ledger = ledger
@@ -39,13 +39,17 @@ class BurstEntryStrategy:
         self.sl_pct = sl_pct
         self.timeout_sec = timeout_sec
         self.cooldown_sec = cooldown_sec
-
         # [추가] 실험 기능 변수
         self.use_dynamic_tp = use_dynamic_tp
         self.dynamic_tp_sec = dynamic_tp_sec
         self.dynamic_tp_ratio = dynamic_tp_ratio
+        self.safe_tp_pct = safe_tp_pct
 
         self._task = asyncio.create_task(self._tp_check_loop())
+        self.all_krw_markets = all_krw_markets  # 전체 KRW 마켓 리스트 저장
+        # [추가] 시장 판단 엔진 배경 실행
+        asyncio.create_task(self._market_judgment_loop())
+
 
     async def on_trade(self, market: str, msg: dict) -> None:
         if msg.get("ask_bid") == "BID":
@@ -80,59 +84,180 @@ class BurstEntryStrategy:
         await self._check_realtime_breakout(market, minute, candle)
 
     async def _check_realtime_breakout(self, market: str, minute, candle: Candle1m) -> None:
-            if market in self.st.positions or market in self._pending_entry: return
-            if len(self.st.positions) >= self.max_positions: return
+        if market in self.st.positions or market in self._pending_entry: return
+        if len(self.st.positions) >= self.max_positions: return
 
-            if market in self.st.cooldown_until:
-                if now_kst() < self.st.cooldown_until[market]:
+        if market in self.st.cooldown_until:
+            if now_kst() < self.st.cooldown_until[market]:
+                return
+
+        # === [수정 및 보완된 눌림목 로직] ===
+        if market in self.st.waiting_pullback:
+            wait_info = self.st.waiting_pullback[market]
+            spike_time = wait_info['spike_time']
+            pump_vol = wait_info['pump_vol']
+            
+            time_diff = (minute - spike_time).total_seconds()
+            
+            # 60초 전후로 유연하게 체크 (네트워크 지연 대비)
+            if 55 <= time_diff <= 65:
+                body_pct = (candle.close - candle.open) / candle.open * 100
+                
+                # [4번 필터: KeyError 방지 처리]
+                current_buy_amt = self.st.buy_amt[market].get(minute, 0)
+                current_sell_amt = candle.total_amt - current_buy_amt
+                
+                # 필터 조건: 눌림 중 매도세가 직전 급등 거래대금의 50%를 초과하면 즉시 포기
+                if current_sell_amt > (pump_vol * 0.5):
+                    self.log.info(f"[{market}] 🚨 설거지(매도세 과다) 포착! 진입 취소 (매도: {current_sell_amt:,.0f} > 기준: {pump_vol*0.5:,.0f})")
+                    del self.st.waiting_pullback[market]
                     return
 
-            # === [추가된 로직 1: 눌림목 대기 명단 확인 및 진입] ===
-            if market in self.st.waiting_pullback:
-                spike_time = self.st.waiting_pullback[market]
-                time_diff = (minute - spike_time).total_seconds()
-                
-                # 1. 급등 캔들 직후의 '다음 1분봉'으로 넘어왔을 때 (60초 차이)
-                if time_diff == 60:
-                    body_pct = (candle.close - candle.open) / candle.open * 100
+                # 1. 저장된 가변 타점 가져오기 (없으면 기본값 -0.3%)
+                target = wait_info.get('target_rate', -0.3)
+
+                # 2. 가변 타점 조건 검사 (-1.0% ~ target 사이일 때 진입)
+                if -1.0 <= body_pct <= target:
+                    self.log.info(f"[{market}] 🎯 필터 통과! 가변 타점 진입 (기준:{target}% / 현재:{body_pct:.2f}%)")
                     
-                    # 2. 시가 대비 -0.1% ~ -1.0% 하락(음봉 눌림)이 발생하면 즉시 매수!
-                    if -1.0 <= body_pct <= -0.3:
-                        self.log.info(f"[{market}] 🎯 눌림목 포착! (하락률: {body_pct:.2f}%) 즉시 매수합니다.")
-                        del self.st.waiting_pullback[market] # 샀으므로 명단에서 제거
-                        
-                        self._pending_entry.add(market)
-                        asyncio.create_task(self._open_position(market, candle.close))
+                    # 중복 진입 방지를 위해 대기열에서 즉시 제거
+                    self.st.waiting_pullback.pop(market, None)
+                    
+                    # 이미 주문 처리 중인 종목인지 확인
+                    if market in self._pending_entry:
                         return
-                        
-                # 3. 만약 시간이 1분(60초) 넘게 지나버렸다면 기회 상실로 보고 명단에서 삭제
-                elif time_diff > 60:
-                    del self.st.waiting_pullback[market]
+                    
+                    # 주문 대기 상태로 등록 후 매수 실행
+                    self._pending_entry.add(market)
+                    asyncio.create_task(self._open_position(market, candle.close))
+                    
+            elif time_diff > 65: # 시간이 너무 지남
+                del self.st.waiting_pullback[market]
             # ==============================================================
 
-            # --- [기존 로직: 새로운 급등(돌파) 캔들 포착] ---
-            buy = self.st.buy_amt[market][minute]
-            total = candle.total_amt
-            prev5 = self.st.prev5[market]
+        # --- [기존 로직: 새로운 급등(돌파) 캔들 포착] ---
+        buy = self.st.buy_amt[market][minute]
+        total = candle.total_amt
+        prev5 = self.st.prev5[market]
 
-            if len(prev5) < 5: return
-            avg5 = sum(prev5) / 5.0
+        if len(prev5) < 5: return
+        avg5 = sum(prev5) / 5.0
 
-            buy_ok = (total > 0) and (buy / total >= self.buy_pressure_th)
-            spike_ok = (avg5 > 0) and (total >= avg5 * self.vol_spike_mult)
-            bull_ok = candle.close > candle.open
-            liq_ok = total >= self.min_amt
+        buy_ok = (total > 0) and (buy / total >= self.buy_pressure_th)
+        spike_ok = (avg5 > 0) and (total >= avg5 * self.vol_spike_mult)
+        bull_ok = candle.close > candle.open
+        liq_ok = total >= self.min_amt
 
-            if buy_ok and spike_ok and bull_ok and liq_ok:
-                # === [수정된 로직 2: 즉시 매수하지 않고 명단에 올림] ===
-                if market not in self.st.waiting_pullback:
-                    self.st.waiting_pullback[market] = minute
-                    msg = f"✋[PULLBACK_WAIT] 🚀 {market} 급등 포착! 다음 1분봉 음봉(-0.3%) 발생 시 진입 대기"
-                    self.log.info(msg)
-                    # (원하신다면 텔레그램으로 대기 알림도 받을 수 있습니다)
-                    await self.notifier.send(msg)
-                # =======================================================
+        if buy_ok and spike_ok and bull_ok and liq_ok:
+            # === [가변 타점 로직이 적용된 명단 등록] ===
+            if market not in self.st.waiting_pullback:
+                # 💡 [핵심] 10분마다 갱신된 전역 변수를 그대로 읽어옵니다.
+                current_score = self.st.market_score
+                current_target = self.st.market_target_rate 
+                
+                self.st.waiting_pullback[market] = {
+                    'spike_time': minute,
+                    'pump_vol': total,
+                    'target_rate': current_target # 이미 결정된 타점 저장
+                }
+                
+                # [수정된 메시지]
+                msg = f"✋[PULLBACK_WAIT] 🚀 {market} 포착! 현재시장점수:{current_score}점 -> 적용타점:{current_target}% 대기"
+                
+                self.log.info(msg)
+                await self.notifier.send(msg)
 
+    async def _market_judgment_loop(self):
+        """10분마다 시장의 '날씨'를 확정하는 핵심 엔진"""
+        # 시작 시 main.py에서 설정한 초기값 로드
+        last_btc_total_vol = getattr(self.st, 'initial_btc_total_vol', 0.0)
+        
+        while True:
+            try:
+                # 1. 전체 마켓 Ticker 정보 수신
+                tickers = await self.rest.tickers(self.all_krw_markets)
+                if not tickers:
+                    await asyncio.sleep(10); continue
+
+                # --- [Step 1] AD Ratio & 전일 종가 갱신 (가중치 4) ---
+                up_count = 0
+                for t in tickers:
+                    m = t['market']
+                    px = t['trade_price']
+                    prev_px = t['prev_closing_price']
+                    self.st.prev_day_close[m] = prev_px # 매번 최신화
+                    if px > prev_px: up_count += 1
+                
+                ad_ratio = (up_count / len(tickers)) * 100
+                # 💡 [수정] 백테스트(CSV)와 실시간의 차이를 반영한 현실적 타점 (전체 243종목 기준)
+                s1 = 4 if ad_ratio >= 40 else (2 if ad_ratio >= 25 else 0)
+
+                # --- [Step 2] BTC 10분 유량 배수 (가중치 3) ---
+                btc_t = next(t for t in tickers if t['market'] == "KRW-BTC")
+                # 💡 [수정] 24h 롤링값이 아니라 당일(09시 리셋) 누적값 사용
+                curr_btc_vol = float(btc_t['acc_trade_price'])
+                
+                # 💡 [수정] 09시 리셋으로 누적액이 0이 될 때 음수가 나오는 현상 방어
+                if curr_btc_vol < last_btc_total_vol: 
+                    ten_min_vol = curr_btc_vol
+                else:
+                    ten_min_vol = curr_btc_vol - last_btc_total_vol if last_btc_total_vol > 0 else 0
+                last_btc_total_vol = curr_btc_vol
+                
+                # --- [Step 2] BTC 10분 유량 배수 (가중치 3) ---
+                # (이전 코드 동일...)
+                if ten_min_vol > 0:
+                    self.st.btc_vol_history.append(ten_min_vol)
+                
+                s2 = 1 # 데이터 부족 시 중립
+                btc_detail = f"10분:{ten_min_vol:,.0f} / 데이터수집중({len(self.st.btc_vol_history)}/3)"
+                
+                if len(self.st.btc_vol_history) == 3:
+                    avg_30m = sum(self.st.btc_vol_history) / 3
+                    mult = ten_min_vol / avg_30m if avg_30m > 0 else 1.0
+                    s2 = 3 if mult >= 1.3 else (1 if mult >= 0.9 else 0)
+                    btc_detail = f"10분:{ten_min_vol:,.0f} / 30분평균:{avg_30m:,.0f} (배수:{mult:.2f})"
+
+                # --- [Step 3] 시장 전체 매수 비중 (가중치 3) ---
+                # (이전 코드 동일...)
+                now_m = now_kst().replace(second=0, microsecond=0)
+                past_5mins = [now_m - timedelta(minutes=i) for i in range(1, 6)]
+                
+                total_m_vol = sum(sum(deq) for deq in self.st.prev5.values())
+                total_m_buy = 0
+                for m_dict in self.st.buy_amt.values():
+                    total_m_buy += sum(m_dict.get(tm, 0) for tm in past_5mins)
+                
+                buy_ratio = (total_m_buy / total_m_vol) * 100 if total_m_vol > 0 else 50
+                s3 = 3 if buy_ratio >= 52 else (1 if buy_ratio >= 49 else 0)
+
+                # --- [결과 확정 및 상세 로깅] ---
+                self.st.market_score = s1 + s2 + s3
+                self.st.market_target_rate = self._get_dynamic_target(self.st.market_score)
+                
+                log_msg = (
+                    f"🌤️ [MARKET_WEATHER] 총점:{self.st.market_score}점 -> 적용타점:{self.st.market_target_rate}%\n"
+                    f" ┣ 📈 [S1:AD비율] 상승 {up_count}/{len(tickers)} ({ad_ratio:.1f}%) -> {s1}점\n"
+                    f" ┣ 🪙 [S2:BTC유량] {btc_detail} -> {s2}점\n"
+                    f" ┗ 🛒 [S3:매수비중] 매수:{total_m_buy:,.0f} / 전체:{total_m_vol:,.0f} ({buy_ratio:.1f}%) -> {s3}점"
+                )
+                self.log.info(log_msg)
+                
+                # 💡 10분봉 마감 시점(0분, 10분, 20분...)까지 남은 시간 계산 후 대기
+                now = now_kst()
+                passed_seconds = (now.minute % 10) * 60 + now.second
+                sleep_sec = 600 - passed_seconds
+                
+                await asyncio.sleep(sleep_sec)
+            except Exception as e:
+                self.log.error(f"[_market_judgment_loop error] {e}")
+                await asyncio.sleep(30)
+
+    def _get_dynamic_target(self, score: int) -> float:
+        """합산 점수에 따른 타점 결정 논리"""
+        if score >= 8: return -0.1  # 강세
+        if score >= 4: return -0.3  # 중립
+        return -0.5                # 약세
 
     async def _open_position(self, market: str, px: float) -> None:
         try:
@@ -225,8 +350,8 @@ class BurstEntryStrategy:
                     return
                 
                 # 시나리오 B: 안전 커트라인 이탈 (이제 정상 작동함!)
-                safe_price_line = pos.tp * (1 - (config.SAFE_TP_PCT / 100.0))
-                
+                safe_price_line = pos.tp * (1 - (self.safe_tp_pct / 100.0))
+
                 if px < safe_price_line: 
                     await self._stop_out(market, pos, px, reason="SAFE_TP")
                     return

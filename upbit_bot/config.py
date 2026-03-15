@@ -51,4 +51,4 @@ class Settings:
     dynamic_tp_ratio: float = env_float("DYNAMIC_TP_RATIO", 2.0)
 
     # [추가] 안전 방어선 퍼센트를 가져옵니다. 값이 없으면 기본값 1.0을 사용합니다.
-    safe_tp_pct: float = float(os.getenv("SAFE_TP_PCT", "1.0"))
+    safe_tp_pct: float = env_float("SAFE_TP_PCT", 1.0)
